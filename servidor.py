@@ -1,77 +1,49 @@
 """
-SERVIDOR — Hub Central de Red TCP
-================================================================================
-ARQUITECTURA ESTRELLA (Star Topology)
---------------------------------------------------------------------------------
-Este modulo implementa el nodo central (hub) de una topologia en estrella.
-En esta arquitectura:
+SERVIDOR — Hub central de la red
 
-  - El servidor es el UNICO punto de conexion de la red.
-  - Ningun nodo habla directamente con otro nodo.
-  - Todo mensaje pasa obligatoriamente por el hub, que lo reenvía
-    al destinatario sin interpretar su contenido (relay transparente).
+Este es el servidor que conecta a todos los nodos de la red.
+Funciona como una especie de "central telefonica": nadie habla
+directamente con nadie, los mensajes pasan siempre por aqui.
 
-  Topologia:
-        validador1 ─────┐
-        validador2 ──── HUB (servidor.py) ──── monitor
-        validador3 ─────┘
+    validador1 ──┐
+    validador2 ──── servidor ──── monitor
+    validador3 ──┘
 
-RESPONSABILIDADES EXCLUSIVAS DEL HUB:
-  1. Aceptar conexiones TCP entrantes de Monitor y Validadores.
-  2. Registrar cada nodo por su nombre unico (handshake inicial).
-  3. Difundir mensajes al canal general (/broadcast o texto libre).
-  4. Enrutar mensajes privados entre dos nodos (/w <destino> <payload>).
-  5. Responder consultas de presencia (/who) para que el Monitor pueda
-     calcular el quorum con nodos realmente conectados.
-  6. Notificar conexiones y desconexiones a toda la red.
+De que se encarga este archivo:
+- aceptar las conexiones de monitor y validadores
+- registrar el nombre de cada nodo cuando se conecta
+- reenviar mensajes de un nodo a otro sin leer el contenido
+- responder /who con la lista de quien esta conectado
+- avisar a todos cuando alguien entra o sale de la red
 
-RESTRICCION ARQUITECTURAL CRITICA:
-  Este modulo NO contiene logica de negocio, NO valida hashes, NO ejecuta
-  reglas de consenso ni de blockchain. Es un relay de red puro.
-  Separar el hub de la logica de aplicacion es un principio de diseno
-  deliberado: permite reemplazar el hub por otro medio de transporte
-  (UDP, WebSocket, etc.) sin tocar la logica de consenso.
-
-PROTOCOLO DE MENSAJES:
-  - Cada mensaje es una linea de texto terminada en '\\n' (delimitador).
-  - El buffer acumulado por conexion (bytearray) reconstruye lineas
-    parciales cuando TCP fragmenta paquetes grandes.
-  - El primer mensaje de cada conexion nueva es el nombre del nodo.
-
-CONCURRENCIA:
-  - Un hilo daemon por cliente, lanzado en _register_client().
-  - _lock protege el diccionario _clients ante accesos concurrentes.
-================================================================================
+Importante: este modulo no tiene nada de logica de blockchain,
+solo pasa mensajes. Eso lo hace el monitor y los validadores.
 """
 
 import socket
 import threading
 
-# ── Configuracion de red ──────────────────────────────────────────────────────
-HOST: str        = "127.0.0.1"   # solo loopback; cambiar a "0.0.0.0" para red real
-PORT: int        = 5000           # puerto TCP del hub
-BUFFER_SIZE: int = 65_536         # 64 KiB: suficiente para bloques JSON grandes
+# configuracion de red
+HOST: str        = "127.0.0.1"   # solo loopback, cambiar a 0.0.0.0 para red real
+PORT: int        = 5000           # puerto del servidor
+BUFFER_SIZE: int = 65_536         # 64kb, suficiente para los mensajes JSON grandes
 
-# ── Estado global del hub (protegido por _lock) ───────────────────────────────
-# _clients mapea nombre_nodo → socket_tcp activo.
-# Es la tabla de enrutamiento del hub: para enviar a "validador1" se busca aquí.
+# estado del servidor
+# _clients es el diccionario que guarda nombre → socket de cada nodo
+# _lock protege ese diccionario para evitar problemas con multiples hilos
 _lock:    threading.Lock            = threading.Lock()
 _clients: dict[str, socket.socket] = {}
 
 
-# ════════════════════════════ UTILIDADES ═════════════════════════════════════
+# ─── utilidades ──────────────────────────────────────────────────────────────
 
 def _safe_send(sock: socket.socket, message: str) -> bool:
     """
-    Envia 'message' por 'sock' añadiendo el delimitador de linea '\\n'.
-
-    El '\\n' es el delimitador del protocolo: los receptores usan un buffer
-    acumulado que solo procesa lineas completas (terminadas en '\\n'), por
-    lo que todo mensaje debe terminar con este caracter.
-
-    Retorna True si el envio fue exitoso, False si el socket esta roto.
-    Los fallos se tratan silenciosamente: el hub no debe caerse porque
-    un cliente se haya desconectado en mitad de un broadcast.
+    Manda un mensaje por el socket.
+    Le agrega \\n al final porque los receptores necesitan ese caracter
+    para saber donde termina el mensaje.
+    Si el socket esta roto o el cliente se desconecto, devuelve False
+    sin tirar error para que el servidor siga funcionando.
     """
     try:
         sock.sendall((message + "\n").encode("utf-8"))
@@ -82,49 +54,40 @@ def _safe_send(sock: socket.socket, message: str) -> bool:
 
 def _broadcast(message: str, exclude: str | None = None) -> None:
     """
-    Difunde 'message' a TODOS los nodos conectados.
+    Manda el mensaje a todos los nodos conectados.
+    Si se le pasa el parametro exclude, ese nodo no recibe nada
+    (sirve para que el que envia no se escuche a si mismo).
 
-    Si se especifica 'exclude', ese nodo no recibe el mensaje.
-    Esto se usa para el chat general donde el emisor no se escucha
-    a si mismo (comportamiento estandar de chat en estrella).
-
-    Implementacion segura ante concurrencia:
-      1. Se toma snapshot de _clients bajo _lock (lectura critica).
-      2. Los envios ocurren FUERA del lock para no bloquear otros hilos
-         mientras se espera que la pila TCP escriba los datos.
+    Primero hacemos una copia de los clientes dentro del lock y luego
+    enviamos afuera del lock, para no bloquear el hilo mientras TCP
+    transmite los datos.
     """
     with _lock:
-        # Snapshot: copia de los pares (nombre, socket) en este instante
+        # hacemos copia rapida para no enviar dentro del lock
         snapshot = [(name, sock)
                     for name, sock in _clients.items()
                     if name != exclude]
 
-    # Enviar fuera del lock: si un socket esta roto, _safe_send falla
-    # silenciosamente sin afectar al resto del broadcast.
+    # enviamos afuera del lock, si un socket falla no afecta a los demas
     for _name, sock in snapshot:
         _safe_send(sock, message)
 
 
 def _send_private(sender: str, target: str, payload: str) -> None:
     """
-    Enruta un mensaje privado de 'sender' a 'target'.
+    Envia un mensaje privado de sender a target.
+    El mensaje llega al destino con el formato:
+        PRIVATE_FROM_sender: payload
 
-    El mensaje llega al destino con el prefijo:
-        PRIVATE_FROM_<sender>: <payload>
-
-    Este mecanismo es el canal indirecto que usan Monitor y Validadores
-    para intercambiar bloques JSON y respuestas sin que el hub interprete
-    el contenido (principio de relay transparente).
-
-    Si el destino no existe o se desconecto, notifica al emisor para
-    que pueda tomar accion (ej: recalcular quorum sin ese nodo).
+    Si el nodo destino no existe o se desconecto, le avisamos
+    al que intento enviar para que sepa que no llego.
     """
     with _lock:
         target_sock = _clients.get(target)
         sender_sock = _clients.get(sender)
 
     if target_sock is None:
-        # El nodo destino no esta conectado: informar al emisor
+        # el destino no esta, avisamos al origen
         if sender_sock:
             _safe_send(
                 sender_sock,
@@ -132,105 +95,78 @@ def _send_private(sender: str, target: str, payload: str) -> None:
             )
         return
 
-    # Reenviar con prefijo de origen para que el receptor identifique al emisor
+    # reenviar con el prefijo para que el receptor sepa quien lo mando
     _safe_send(target_sock, f"PRIVATE_FROM_{sender}: {payload}")
 
 
 def _get_connected_nodes() -> list[str]:
     """
-    Retorna la lista de nombres de nodos actualmente conectados al hub.
-
-    Usada por el comando /who para que el Monitor calcule el quorum
-    con validadores REALMENTE activos, no solo con nombres escritos
-    por el usuario que podrian no estar en linea.
+    Retorna una lista con los nombres de todos los nodos conectados ahora.
+    La usa el monitor cuando pregunta /who para calcular el quorum.
     """
     with _lock:
         return list(_clients.keys())
 
 
-# ════════════════════════ BUFFER TCP ════════════════════════════════════════
+# ─── manejo del buffer TCP ───────────────────────────────────────────────────
 
 def _iter_lines(buf: bytearray) -> tuple[list[str], bytearray]:
     """
-    Extrae lineas completas (terminadas en '\\n') del buffer acumulado.
+    Extrae las lineas completas del buffer acumulado.
 
-    PROBLEMA QUE RESUELVE — Fragmentacion y fusion de paquetes TCP:
-      TCP es un protocolo de STREAM, no de mensajes. Un solo recv() puede:
-        a) Devolver MENOS de una linea completa  (paquete fragmentado).
-        b) Devolver VARIAS lineas fusionadas      (nagle / coalescing).
+    El problema con TCP es que es un protocolo de stream de bytes: a veces
+    recv() devuelve solo un pedazo del mensaje, y a veces devuelve varios
+    mensajes pegados. Si procesamos directamente lo que llega podemos
+    cortar un mensaje JSON a la mitad y danar el bloque.
 
-      Si se llama split('\\n') directamente sobre recv(), el caso (a)
-      produce una linea incompleta que se procesa como si estuviera completa,
-      corrompiendo el JSON del bloque.
+    La solucion es guardar todo en un buffer y solo procesar las partes
+    que ya tienen \\n al final. Lo que queda sin \\n se guarda para el
+    siguiente recv().
 
-    SOLUCION — Buffer acumulado por conexion:
-      - Se extiende buf con cada chunk recibido.
-      - Solo se procesan los fragmentos terminados en '\\n'.
-      - El ultimo fragmento (posiblemente incompleto) queda en buf
-        hasta que llegue el resto en el siguiente recv().
-
-    Retorna:
-      complete : lista de strings de lineas completas (sin '\\n' al final).
-      leftover : bytearray con el fragmento incompleto restante.
+    Devuelve las lineas completas y el fragmento sobrante.
     """
     text  = buf.decode("utf-8", errors="replace")
     parts = text.split("\n")
-    # parts[-1] es el fragmento sin '\n' final (puede estar vacio o incompleto)
+    # parts[-1] es lo que no tiene \n todavia, puede estar incompleto
     complete = parts[:-1]
     leftover = parts[-1].encode("utf-8")
     return complete, bytearray(leftover)
 
 
-# ══════════════════════ MANEJO DE CONEXIONES ═════════════════════════════════
+# ─── conexiones de clientes ───────────────────────────────────────────────────
 
 def _handle_client(conn: socket.socket, name: str) -> None:
     """
-    Bucle de recepcion y enrutamiento para un nodo ya registrado.
+    Loop de recepcion y enrutamiento para un nodo ya registrado.
 
-    Comandos soportados (cada uno en una linea terminada en '\\n'):
+    Comandos que soporta (cada uno termina en \\n):
 
-      /w <nodo> <mensaje>
-          Mensaje privado al nodo indicado via _send_private().
-          Usado por el Monitor para enviar bloques JSON a cada validador.
+      /w nodo mensaje     → manda mensaje privado a ese nodo
+      /broadcast mensaje  → lo reciben todos, incluso el que envia
+      /who                → responde con la lista de nodos conectados
+      texto libre         → broadcast a todos menos al emisor
+                            (los validadores usan esto para mandar votos)
 
-      /broadcast <mensaje>
-          Difusion explicita que INCLUYE al propio emisor.
-          Usado por el Monitor para anunciar CONSENSO_ALCANZADO y
-          BIFURCACION_DETECTADA a toda la red.
-
-      /who
-          Consulta de presencia: el hub responde con la lista de nodos
-          conectados en este momento.
-          Usado por el Monitor para calcular el quorum real antes de
-          distribuir bloques.
-
-      <texto libre>
-          Broadcast general que EXCLUYE al emisor.
-          Usado por los Validadores para emitir votos publicos:
-              VOTE|block_001|YES
-
-    CONCURRENCIA:
-      Cada cliente corre en su propio hilo daemon (ver main()).
-      El buffer 'buf' es local a este hilo: no hay condicion de carrera
-      entre clientes distintos.
+    Cada cliente corre en su propio hilo, asi varios pueden enviar
+    mensajes al mismo tiempo sin bloquearse entre si.
     """
-    buf = bytearray()   # buffer acumulado por conexion (TCP stream)
+    buf = bytearray()   # buffer acumulado para este cliente
     try:
         while True:
             chunk = conn.recv(BUFFER_SIZE)
             if not chunk:
-                break   # FIN TCP limpio: el cliente cerro la conexion
+                break   # el cliente cerro la conexion limpiamente
 
-            # Acumular el chunk y extraer solo lineas completas
+            # acumular lo recibido y sacar solo las lineas ya completas
             buf.extend(chunk)
             lines, buf = _iter_lines(buf)
 
             for raw in lines:
                 raw = raw.strip()
                 if not raw:
-                    continue   # ignorar lineas vacias (artefactos del delimitador)
+                    continue   # linea vacia, ignorar
 
-                # ── /w → mensaje privado ──────────────────────────────────
+                # /w → mensaje privado
                 if raw.startswith("/w "):
                     rest    = raw[3:].strip()
                     sep_idx = rest.find(" ")
@@ -241,29 +177,29 @@ def _handle_client(conn: socket.socket, name: str) -> None:
                         msg    = rest[sep_idx + 1:]
                         _send_private(name, target, msg)
 
-                # ── /broadcast → difusion explicita (incluye emisor) ──────
+                # /broadcast → difusion incluyendo al emisor
                 elif raw.startswith("/broadcast "):
                     payload = raw[len("/broadcast "):].strip()
-                    # Sin exclude: el emisor (Monitor) tambien recibe el eco
+                    # sin exclude para que el monitor tambien reciba el eco
                     _broadcast(f"{name}: {payload}")
 
-                # ── /who → lista de nodos conectados (para quorum real) ───
+                # /who → lista de nodos (para que el monitor calcule el quorum)
                 elif raw.strip() == "/who":
                     nodes = _get_connected_nodes()
-                    # Respuesta privada al nodo que pregunto
+                    # respondemos solo al que pregunto
                     _safe_send(conn, f"[SERVIDOR] Nodos conectados: {','.join(nodes)}")
 
-                # ── texto libre → broadcast general (excluye emisor) ──────
+                # texto libre → broadcast sin el emisor (para los votos de validadores)
                 else:
-                    # Los validadores usan esta rama para emitir votos publicos
+                    # los validadores usan esta rama para emitir sus votos
                     _broadcast(f"{name}: {raw}", exclude=name)
 
     except OSError:
-        # Desconexion forzosa: RST, proceso terminado, red caida, etc.
+        # desconexion inesperada
         pass
 
     finally:
-        # Limpiar registro y notificar a la red que el nodo se fue
+        # sacar al nodo del registro y notificar a los demas
         with _lock:
             _clients.pop(name, None)
         print(f"[SERVIDOR] '{name}' desconectado.")
@@ -276,26 +212,18 @@ def _handle_client(conn: socket.socket, name: str) -> None:
 
 def _register_client(conn: socket.socket, addr: tuple) -> None:
     """
-    Handshake inicial con un nuevo cliente TCP.
+    Registra a un cliente nuevo que acaba de conectarse.
 
-    Protocolo de registro:
-      1. El cliente envia su nombre de nodo como primera linea (con '\\n').
-      2. El servidor valida: no vacio, sin espacios, nombre no en uso.
-      3. Si pasa: registra en _clients y delega a _handle_client().
-      4. Si falla: envia mensaje de error y cierra la conexion.
+    Lo primero que manda el cliente es su nombre. Lo leemos y validamos:
+      - que no este vacio
+      - que no tenga espacios (romperia el parseo de /w nodo mensaje)
+      - que no haya otro nodo con el mismo nombre
 
-    Validaciones:
-      - Nombre no vacio: un nodo sin nombre no puede ser enrutado.
-      - Sin espacios: el espacio es el separador en '/w <nodo> <msg>',
-        un nombre con espacios romperia el parseo del comando.
-      - Nombre unico: evita que dos procesos compitan por el mismo slot
-        y se sobreescriban mutuamente en _clients.
-
-    El buffer acumulado garantiza que leemos el nombre completo incluso
-    si el SO entrego el primer paquete partido.
+    Si todo esta bien lo guardamos en _clients y lo mandamos a _handle_client.
+    Si algo falla, mandamos un mensaje de error y cerramos la conexion.
     """
     try:
-        # Acumular bytes hasta recibir el nombre completo (linea terminada en '\n')
+        # leer bytes hasta encontrar \n para tener el nombre completo
         buf = bytearray()
         while b"\n" not in buf and len(buf) < 1024:
             chunk = conn.recv(1024)
@@ -304,33 +232,33 @@ def _register_client(conn: socket.socket, addr: tuple) -> None:
                 return
             buf.extend(chunk)
 
-        # Extraer solo la primera linea (el nombre del nodo)
+        # tomar la primera linea como nombre del nodo
         name = buf.decode("utf-8", errors="replace").split("\n")[0].strip()
 
-        # Validacion 1: nombre no vacio
+        # nombre no vacio
         if not name:
             _safe_send(conn, "[SERVIDOR] Error: nombre de nodo vacio.")
             conn.close()
             return
 
-        # Validacion 2: sin espacios (romperia el parseo de /w)
+        # sin espacios porque si no el comando /w no funcionaria
         if " " in name:
             _safe_send(conn, "[SERVIDOR] Error: el nombre no puede tener espacios.")
             conn.close()
             return
 
-        # Validacion 3: nombre unico (bajo lock para evitar race condition)
+        # nombre unico (bajo lock para evitar que dos nodos se registren igual al mismo tiempo)
         with _lock:
             if name in _clients:
                 _safe_send(conn, f"[SERVIDOR] El nombre '{name}' ya esta en uso.")
                 conn.close()
                 return
-            _clients[name] = conn   # registro atomico
+            _clients[name] = conn   # registrar al nodo
 
         print(f"[SERVIDOR] '{name}' conectado desde {addr[0]}:{addr[1]}")
         _broadcast(f"[SERVIDOR] '{name}' se ha unido a la red.", exclude=name)
 
-        # Delegar el control al loop de mensajes del cliente
+        # pasar al loop de mensajes ya que el registro fue exitoso
         _handle_client(conn, name)
 
     except OSError:
@@ -340,21 +268,18 @@ def _register_client(conn: socket.socket, addr: tuple) -> None:
             pass
 
 
-# ══════════════════════════ PUNTO DE ENTRADA ════════════════════════════════
+# ─── punto de entrada ─────────────────────────────────────────────────────────
 
 def main() -> None:
     """
-    Inicia el hub TCP y acepta conexiones indefinidamente.
+    Arranca el servidor y se queda aceptando conexiones.
 
-    Modelo de concurrencia:
-      - Un hilo daemon por cliente: cada _register_client() corre en su
-        propio hilo, por lo que multiples nodos pueden conectarse y
-        enviarse mensajes simultaneamente sin bloquear al servidor.
-      - daemon=True: los hilos de cliente mueren automaticamente cuando
-        el proceso principal termina (Ctrl+C), sin necesidad de join().
+    Cada cliente nuevo corre en su propio hilo daemon para que varios
+    nodos puedan conectarse y mandarse mensajes al mismo tiempo.
 
-    SO_REUSEADDR: permite relanzar el servidor inmediatamente despues de
-    cerrarlo sin esperar el TIME_WAIT de TCP (util en desarrollo).
+    SO_REUSEADDR sirve para poder reiniciar el servidor inmediatamente
+    despues de cerrarlo sin esperar a que el puerto quede libre.
+    Es muy util cuando uno lo cierra y lo vuelve a abrir enseguida.
     """
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -371,7 +296,7 @@ def main() -> None:
     try:
         while True:
             conn, addr = server_sock.accept()
-            # Un hilo por cliente: el hub no se bloquea esperando a uno solo
+            # hilo por cliente para que el servidor no se quede bloqueado esperando a uno
             threading.Thread(
                 target=_register_client,
                 args=(conn, addr),
@@ -380,7 +305,7 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\n[SERVIDOR] Senal de apagado recibida.")
     finally:
-        # Cierre limpio: cerrar todos los sockets de clientes activos
+        # cerrar todos los sockets al apagar
         with _lock:
             for sock in _clients.values():
                 try:
